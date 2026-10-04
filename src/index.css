@@ -1,0 +1,30 @@
+@import "tailwindcss";
+
+@theme {
+  --color-warm-alabaster: #faf8f5;
+  --color-warm-taupe: #7a7269;
+  --color-text-light: #1c222b;
+
+  --color-warm-obsidian: #141210;
+  --color-card-dark: #1e1b18;
+  --color-border-dark: #2e2925;
+  --color-text-dark: #f5f0eb;
+
+  --color-primary: #f26b5b;
+  --color-primary-hover: #e0533f;
+}
+
+body {
+  width: 360px;
+  min-height: 480px;
+  margin: 0;
+  font-family: Inter, system-ui, -apple-system, sans-serif;
+  @apply bg-warm-alabaster text-text-light dark:bg-warm-obsidian dark:text-text-dark transition-colors duration-200;
+}
+
+/* Base dark mode setup if OS is dark mode or manual */
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+  }
+}
