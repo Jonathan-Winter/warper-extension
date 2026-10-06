@@ -7,7 +7,10 @@ interface VideoItem {
   fileName: string;
   suggested_filename?: string;
   size: number;
+  sizeEstimated?: boolean;
   type: string;
+  stream?: string;
+  quality?: string;
 }
 
 export default function Popup() {
@@ -85,10 +88,16 @@ export default function Popup() {
     navigator.clipboard.writeText(url);
   };
 
-  const formatSize = (bytes: number) => {
+  const formatSize = (bytes: number, estimated?: boolean) => {
     if (!bytes) return 'Unknown Size';
-    const mb = bytes / (1024 * 1024);
-    return `${mb.toFixed(2)} MB`;
+    const units = ['MB', 'GB', 'TB'];
+    let value = bytes / (1024 * 1024);
+    let i = 0;
+    while (value >= 1024 && i < units.length - 1) {
+      value /= 1024;
+      i++;
+    }
+    return `${estimated ? '~' : ''}${value.toFixed(2)} ${units[i]}`;
   };
 
   return (
@@ -161,8 +170,14 @@ export default function Popup() {
                       <span className="bg-gray-100 dark:bg-black/30 px-1.5 py-0.5 rounded text-[10px] font-bold uppercase tracking-wide">
                         {vid.type}
                       </span>
+                      {vid.quality && (
+                        <span className="bg-primary/10 text-primary px-1.5 py-0.5 rounded text-[10px] font-bold">
+                          {vid.quality}
+                        </span>
+                      )}
+                      {vid.stream && <span className="text-[10px]">{vid.stream}</span>}
                       <span>•</span>
-                      <span>{formatSize(vid.size)}</span>
+                      <span>{formatSize(vid.size, vid.sizeEstimated)}</span>
                     </div>
                   </div>
                 </div>

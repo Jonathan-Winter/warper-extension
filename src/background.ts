@@ -88,111 +88,308 @@ chrome.downloads.onCreated.addListener((item) => {
 });
 
 // 2. Video Sniffer
+interface VideoEntry {
+  url: string;
+  referer: string;
+  fileName: string;
+  suggested_filename: string;
+  size: number;
+  sizeEstimated?: boolean;
+  type: string;      // นามสกุลไฟล์จริงที่จะได้ เช่น MP4, TS, WEBM
+  stream?: "HLS";
+  quality?: string;  // เช่น 720p
+  bandwidth?: number;
+}
+
+const MEDIA_EXTS = ['.mp4', '.mkv', '.webm', '.mov', '.flv', '.mp3', '.m4a'];
+const JUNK_EXTS = ['ts', 'm4s', 'jpeg', 'jpg'];
+const MIME_EXT: Record<string, string> = {
+  "video/mp4": "mp4",
+  "video/webm": "webm",
+  "video/x-matroska": "mkv",
+  "video/quicktime": "mov",
+  "video/x-flv": "flv",
+  "video/ogg": "ogv",
+  "audio/mpeg": "mp3",
+  "audio/mp4": "m4a",
+  "audio/x-m4a": "m4a",
+  "audio/aac": "aac",
+  "audio/ogg": "ogg",
+  "audio/webm": "weba",
+  "audio/wav": "wav",
+};
+
+const urlExt = (url: string) => {
+  try {
+    return new URL(url).pathname.toLowerCase().match(/\.([a-z0-9]+)$/)?.[1] || "";
+  } catch {
+    return "";
+  }
+};
+
+const mediaExt = (url: string, contentType?: string) => {
+  const ext = urlExt(url);
+  if (MEDIA_EXTS.includes(`.${ext}`) || Object.values(MIME_EXT).includes(ext)) return ext;
+  const mime = contentType?.split(';')[0].trim();
+  return (mime && MIME_EXT[mime]) || "mp4";
+};
+
+// URL ที่จัดการไปแล้วต่อแท็บ: กันไม่ให้ playlist ที่เรา fetch เองวนกลับมาเข้า listener ซ้ำ
+const handledUrls = new Map<number, Set<string>>();
+const markHandled = (tabId: number, url: string) => {
+  let set = handledUrls.get(tabId);
+  if (!set) handledUrls.set(tabId, set = new Set());
+  if (set.has(url)) return false;
+  set.add(url);
+  return true;
+};
+
+// อ่าน/เขียน storage ทีละคิว: ถ้า request หลายตัวมาพร้อมกัน (เช่น master + variant playlist)
+// ต่างคนต่าง get แล้ว set ทับกัน ทำให้เหลือแค่รายการเดียว
+let storageQueue: Promise<unknown> = Promise.resolve();
+function updateVideos(mutate: (videos: Record<number, VideoEntry[]>) => void) {
+  const run = storageQueue.then(async () => {
+    const data = await chrome.storage.session.get('videos');
+    const videos = (data.videos || {}) as Record<number, VideoEntry[]>;
+    mutate(videos);
+    await chrome.storage.session.set({ videos });
+  });
+  storageQueue = run.catch(() => {});
+  return run;
+}
+
+async function addVideos(tabId: number, entries: VideoEntry[]) {
+  if (entries.length === 0) return;
+  let count = 0;
+  await updateVideos((videos) => {
+    const list = videos[tabId] ||= [];
+    for (const entry of entries) {
+      const existing = list.find(v => v.url === entry.url);
+      if (!existing) list.push(entry);
+      else if (entry.quality) Object.assign(existing, entry); // ข้อมูลจาก master playlist ละเอียดกว่า
+    }
+    count = list.length;
+  });
+  chrome.action.setBadgeText({ text: count.toString(), tabId });
+  chrome.action.setBadgeBackgroundColor({ color: "#f26b5b", tabId });
+}
+
+async function getPageTitle(tabId: number, fallback: string) {
+  let cleanTitle = fallback;
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        let title = "";
+        const ogTitle = document.querySelector('meta[property="og:title"]');
+        if (ogTitle && ogTitle.getAttribute("content")) {
+          title = ogTitle.getAttribute("content") as string;
+        }
+        if (!title) {
+          title = document.title;
+          // Remove common suffixes like " - Watch Online", " | SiteName", etc.
+          title = title.replace(/\s*[-|]\s*(Watch Online|HD|Free|Ep\.|Episode).*/i, '').trim();
+          // Also trim standard domain pipe
+          title = title.split(' | ')[0].trim();
+        }
+        if (!title || title.trim() === "") {
+          const h1 = document.querySelector('h1');
+          if (h1 && h1.innerText) {
+            title = h1.innerText;
+          } else {
+             const video = document.querySelector('video[title]');
+             if (video) title = video.getAttribute("title") as string;
+          }
+        }
+        return title;
+      }
+    });
+    if (results && results[0] && results[0].result) {
+      cleanTitle = results[0].result;
+    }
+  } catch (e) {
+    // Ignore scripting errors (e.g., chrome:// URLs)
+  }
+  return cleanTitle.replace(/[\\/:*?"<>|]/g, "").trim() || "Video";
+}
+
+// โหลด playlist จากในเฟรมของหน้าเว็บก่อน (ได้ Referer/Origin เดียวกับ player ที่ CDN มักเช็ค)
+// ถ้าไม่ได้ค่อย fetch จาก service worker (host_permissions ข้าม CORS ได้)
+async function fetchText(url: string, tabId: number, frameId: number) {
+  try {
+    const [res] = await chrome.scripting.executeScript({
+      target: { tabId, frameIds: [frameId] },
+      func: async (u: string) => {
+        try {
+          const r = await fetch(u);
+          return r.ok ? await r.text() : null;
+        } catch {
+          return null;
+        }
+      },
+      args: [url],
+    });
+    if (res?.result) return res.result as string;
+  } catch (e) {
+    // Frame gone or not scriptable
+  }
+  try {
+    const r = await fetch(url);
+    if (r.ok) return await r.text();
+  } catch (e) {
+    // Network/CORS failure
+  }
+  return null;
+}
+
+const parseAttrs = (line: string) => {
+  const attrs: Record<string, string> = {};
+  for (const m of line.matchAll(/([A-Z0-9-]+)=("[^"]*"|[^,]*)/g)) {
+    attrs[m[1]] = m[2].replace(/^"|"$/g, "");
+  }
+  return attrs;
+};
+
+function parseMasterPlaylist(text: string, baseUrl: string) {
+  const lines = text.split(/\r?\n/).map(l => l.trim());
+  const variants: { url: string; bandwidth: number; quality?: string }[] = [];
+  lines.forEach((line, i) => {
+    if (!line.startsWith("#EXT-X-STREAM-INF:")) return;
+    const uri = lines.slice(i + 1).find(l => l && !l.startsWith("#"));
+    if (!uri) return;
+    const attrs = parseAttrs(line.slice("#EXT-X-STREAM-INF:".length));
+    const height = attrs.RESOLUTION?.split("x")[1];
+    variants.push({
+      url: new URL(uri, baseUrl).href,
+      bandwidth: Number(attrs["AVERAGE-BANDWIDTH"] || attrs.BANDWIDTH) || 0,
+      quality: height ? `${height}p` : undefined,
+    });
+  });
+  return variants.sort((a, b) => b.bandwidth - a.bandwidth);
+}
+
+function parseMediaPlaylist(text: string) {
+  let duration = 0;
+  let bytes = 0;
+  for (const line of text.split(/\r?\n/)) {
+    if (line.startsWith("#EXTINF:")) duration += parseFloat(line.slice(8)) || 0;
+    else if (line.startsWith("#EXT-X-BYTERANGE:")) bytes += parseInt(line.slice(17), 10) || 0;
+  }
+  return {
+    duration,
+    bytes,
+    isLive: !text.includes("#EXT-X-ENDLIST"),
+    // ตามสเปก HLS: ถ้าไม่มี EXT-X-MAP (init segment) segment เป็น MPEG-TS, ถ้ามีคือ fMP4
+    // ใช้ตรงนี้แทนนามสกุล segment เพราะบางเว็บปลอมเป็น .jpeg/.png
+    container: text.includes("#EXT-X-MAP") ? "mp4" : "ts",
+  };
+}
+
+function makeHlsEntry(
+  url: string, referer: string, title: string,
+  playlist: string | null, variant?: { bandwidth: number; quality?: string },
+): VideoEntry {
+  const info = playlist ? parseMediaPlaylist(playlist) : null;
+  const ext = info?.container || "ts";
+  let size = 0;
+  let sizeEstimated = false;
+  if (info && !info.isLive) {
+    if (info.bytes) size = info.bytes;
+    else if (variant?.bandwidth && info.duration) {
+      size = Math.round(variant.bandwidth * info.duration / 8);
+      sizeEstimated = true;
+    }
+  }
+  const fileName = `${title}.${ext}`;
+  return {
+    url, referer, fileName, suggested_filename: fileName,
+    size, sizeEstimated,
+    type: ext.toUpperCase(),
+    stream: "HLS",
+    quality: variant?.quality,
+    bandwidth: variant?.bandwidth,
+  };
+}
+
+async function handleHls(tabId: number, frameId: number, url: string, referer: string, title: string) {
+  const text = await fetchText(url, tabId, frameId);
+  if (!text || !text.includes("#EXT-X-STREAM-INF")) {
+    // Media playlist ตัวเดียว (หรือโหลดไม่ได้)
+    await addVideos(tabId, [makeHlsEntry(url, referer, title, text)]);
+    return;
+  }
+  // Master playlist: แตกเป็นทุกความละเอียดแบบที่ IDM แสดง
+  const variants = parseMasterPlaylist(text, url);
+  variants.forEach(v => markHandled(tabId, v.url));
+  const entries = await Promise.all(variants.map(async v =>
+    makeHlsEntry(v.url, referer, title, await fetchText(v.url, tabId, frameId), v)
+  ));
+  await addVideos(tabId, entries);
+}
+
 chrome.webRequest.onHeadersReceived.addListener(
   ((details: any) => {
     (async () => {
     if (details.tabId < 0) return;
 
     const url = details.url.toLowerCase();
-    
-    // Ignore junk
-    if (url.includes('.ts') || url.includes('.m4s') || url.includes('.jpeg') || url.includes('.jpg')) {
+    const ext = urlExt(details.url);
+    const contentTypeHeader = details.responseHeaders?.find((h: any) => h.name.toLowerCase() === 'content-type')?.value?.toLowerCase();
+
+    const isM3u8 = url.includes('.m3u8') ||
+      !!contentTypeHeader && (contentTypeHeader.includes('application/vnd.apple.mpegurl') || contentTypeHeader.includes('application/x-mpegurl'));
+
+    // Ignore junk (HLS/DASH segments, images)
+    if (!isM3u8 && (JUNK_EXTS.includes(ext) || contentTypeHeader?.startsWith('video/mp2t') || contentTypeHeader?.startsWith('video/iso.segment'))) {
       return;
     }
 
-    let isM3u8 = url.includes('.m3u8');
-    let isVideo = ['.mp4', '.mkv', '.webm', '.mov', '.flv', '.mp3', '.m4a'].some(ext => url.includes(ext));
-    
-    const contentTypeHeader = details.responseHeaders?.find((h: any) => h.name.toLowerCase() === 'content-type')?.value?.toLowerCase();
-    
+    let isVideo = !isM3u8 && MEDIA_EXTS.some(e => url.includes(e));
     if (!isM3u8 && !isVideo) {
-        if (contentTypeHeader && (contentTypeHeader.includes('application/vnd.apple.mpegurl') || contentTypeHeader.includes('application/x-mpegurl'))) {
-           isM3u8 = true;
-        } else if (contentTypeHeader && (contentTypeHeader.startsWith('video/') || contentTypeHeader.startsWith('audio/'))) {
+        if (contentTypeHeader && (contentTypeHeader.startsWith('video/') || contentTypeHeader.startsWith('audio/'))) {
            isVideo = true;
         } else {
            return;
         }
     }
-    
+
     const clHeader = details.responseHeaders?.find((h: any) => h.name.toLowerCase() === 'content-length')?.value;
     const size = clHeader ? parseInt(clHeader, 10) : 0;
-    
+
     // Ignore small files unless it's m3u8
     if (!isM3u8 && size < 300 * 1024) {
       return;
     }
-    
+
+    if (!markHandled(details.tabId, details.url)) return;
+
     let tab;
     try {
       tab = await chrome.tabs.get(details.tabId);
     } catch(e) {
       return; // Tab closed
     }
-    
+
     if (!tab) return;
 
     const referer = tab.url || "";
-    let cleanTitle = tab.title || "Video";
-    
-    try {
-      const results = await chrome.scripting.executeScript({
-        target: { tabId: details.tabId },
-        func: () => {
-          let title = "";
-          const ogTitle = document.querySelector('meta[property="og:title"]');
-          if (ogTitle && ogTitle.getAttribute("content")) {
-            title = ogTitle.getAttribute("content") as string;
-          }
-          if (!title) {
-            title = document.title;
-            // Remove common suffixes like " - Watch Online", " | SiteName", etc.
-            title = title.replace(/\s*[-|]\s*(Watch Online|HD|Free|Ep\.|Episode).*/i, '').trim();
-            // Also trim standard domain pipe
-            title = title.split(' | ')[0].trim();
-          }
-          if (!title || title.trim() === "") {
-            const h1 = document.querySelector('h1');
-            if (h1 && h1.innerText) {
-              title = h1.innerText;
-            } else {
-               const video = document.querySelector('video[title]');
-               if (video) title = video.getAttribute("title") as string;
-            }
-          }
-          return title;
-        }
-      });
-      if (results && results[0] && results[0].result) {
-        cleanTitle = results[0].result;
-      }
-    } catch (e) {
-      // Ignore scripting errors (e.g., chrome:// URLs)
+    const cleanTitle = await getPageTitle(details.tabId, tab.title || "Video");
+
+    if (isM3u8) {
+      await handleHls(details.tabId, details.frameId, details.url, referer, cleanTitle);
+      return;
     }
 
-    cleanTitle = cleanTitle.replace(/[\\/:*?"<>|]/g, "").trim() || "Video";
-    const type = isM3u8 ? "HLS (.m3u8)" : "Media";
-    const ext = isM3u8 ? ".ts" : (isVideo && contentTypeHeader ? (contentTypeHeader.split('/')[1]?.split(';')[0] || "mp4") : "mp4");
-    const fileName = `${cleanTitle}.${ext}`;
-    
-    const data = await chrome.storage.session.get('videos');
-    const videos = data.videos || {};
-    if (!videos[details.tabId]) videos[details.tabId] = [];
-    
-    if (!videos[details.tabId].find((v: any) => v.url === details.url)) {
-        videos[details.tabId].push({
-            url: details.url,
-            referer,
-            fileName,
-            suggested_filename: fileName,
-            size,
-            type
-        });
-        await chrome.storage.session.set({ videos });
-        
-        chrome.action.setBadgeText({ text: videos[details.tabId].length.toString(), tabId: details.tabId });
-        chrome.action.setBadgeBackgroundColor({ color: "#f26b5b", tabId: details.tabId });
-    }
+    const fileExt = mediaExt(details.url, contentTypeHeader);
+    const fileName = `${cleanTitle}.${fileExt}`;
+    await addVideos(details.tabId, [{
+      url: details.url,
+      referer,
+      fileName,
+      suggested_filename: fileName,
+      size,
+      type: fileExt.toUpperCase(),
+    }]);
     })();
   }) as any,
   { urls: ["<all_urls>"] },
@@ -200,24 +397,16 @@ chrome.webRequest.onHeadersReceived.addListener(
 );
 
 // Clear on tab change
-chrome.tabs.onRemoved.addListener(async (tabId: any) => {
-    const data = await chrome.storage.session.get('videos');
-    const videos = data.videos || {};
-    if (videos[tabId]) {
-        delete videos[tabId];
-        await chrome.storage.session.set({ videos });
-    }
+chrome.tabs.onRemoved.addListener((tabId: any) => {
+    handledUrls.delete(tabId);
+    updateVideos((videos) => { delete videos[tabId]; });
 });
 
-chrome.tabs.onUpdated.addListener(async (tabId: any, changeInfo: any) => {
+chrome.tabs.onUpdated.addListener((tabId: any, changeInfo: any) => {
     if (changeInfo.status === 'loading' && changeInfo.url) {
-        const data = await chrome.storage.session.get('videos');
-        const videos = data.videos || {};
-        if (videos[tabId]) {
-            delete videos[tabId];
-            await chrome.storage.session.set({ videos });
-            chrome.action.setBadgeText({ text: "", tabId: tabId });
-        }
+        handledUrls.delete(tabId);
+        updateVideos((videos) => { delete videos[tabId]; });
+        chrome.action.setBadgeText({ text: "", tabId: tabId });
     }
 });
 
